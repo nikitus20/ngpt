@@ -573,7 +573,8 @@ class nGPT(Module):
         self,
         ids,
         mask = None,
-        return_loss = False
+        return_loss = False,
+        return_breakdown = False
     ):
         device = ids.device
         token_embed = self.token_embed.weight.to(device)
@@ -610,7 +611,10 @@ class nGPT(Module):
             labels,
             ignore_index = self.ignore_index
         )
-
+        
+        if return_breakdown:
+            return loss, (loss, torch.tensor(0., device=device), torch.tensor(0., device=device))
+        
         return loss
 
     def to(self, device):

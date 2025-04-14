@@ -4,6 +4,10 @@ import random
 import tqdm
 import numpy as np
 from contextlib import nullcontext
+import os
+import argparse
+import json
+from datetime import datetime
 
 import torch
 from torch.optim import Adam
@@ -16,11 +20,12 @@ from nGPT_pytorch import nGPT
 
 # constants
 
-NUM_BATCHES = int(1e5)
+NUM_BATCHES = int(1e4)
 BATCH_SIZE = 4
 GRAD_ACCUM_EVERY = 4
 LEARNING_RATE = 1e-3
 VALIDATE_EVERY = 100
+SAVE_EVERY = 1000
 PRIME_LENGTH = 128
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
@@ -164,9 +169,57 @@ val_loader = cycle(val_loader)
 if not USE_PARAMETRIZE:
     model.register_step_post_hook(optim)
 
+# Create a directory for model checkpoints if it doesn't exist
+os.makedirs("checkpoints", exist_ok=True)
+os.makedirs("metrics", exist_ok=True)
+
+# Initialize metrics tracking
+metrics = {
+    'train_loss': [],
+    'val_loss': [],
+    'epochs': []
+}
+
+# Function to save metrics
+def save_metrics(metrics, filename="metrics/training_metrics.json"):
+    with open(filename, 'w') as f:
+        json.dump(metrics, f, indent=4)
+    print(f"Metrics saved to {filename}")
+
+# Function to load a checkpoint
+def load_checkpoint(model, optimizer, checkpoint_path):
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        print(f"Loaded checkpoint from epoch {start_epoch}")
+        return start_epoch
+    else:
+        print(f"Checkpoint {checkpoint_path} not found. Starting from scratch.")
+        return 0
+
+# Check if a specific checkpoint should be loaded
+parser = argparse.ArgumentParser(description='Train the nGPT model')
+parser.add_argument('--checkpoint', type=str, help='Path to checkpoint file to resume training from')
+args = parser.parse_args()
+
 # training
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
+start_epoch = 0
+if args.checkpoint:
+    start_epoch = load_checkpoint(model, optim, args.checkpoint)
+    # Try to load metrics if they exist
+    metrics_file = "metrics/training_metrics.json"
+    if os.path.exists(metrics_file):
+        with open(metrics_file, 'r') as f:
+            metrics = json.load(f)
+        print(f"Loaded metrics from {metrics_file}")
+
+for i in tqdm.tqdm(range(start_epoch, NUM_BATCHES), mininterval = 10.0, desc = "training"):
     model.train()
+    
+    epoch_train_loss = 0.0
+    num_batches = 0
 
     for _ in range(GRAD_ACCUM_EVERY):
         data = next(train_loader)
@@ -174,18 +227,37 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         # For MPS, we need to handle training differently
         if USE_MPS:
             # MPS doesn't support autocast, so we'll just run without it
-            loss = model(data, return_loss = True)
-            loss = loss / GRAD_ACCUM_EVERY
+            loss = model(data, return_loss = True, return_breakdown = True)
+            if isinstance(loss, tuple):
+                total_loss, _ = loss
+                loss = total_loss / GRAD_ACCUM_EVERY
+                print(f"training loss: {total_loss.item():.3f}")
+                epoch_train_loss += total_loss.item()
+            else:
+                loss = loss / GRAD_ACCUM_EVERY
+                print(f"training loss: {loss.item():.3f}")
+                epoch_train_loss += loss.item()
             loss.backward()
         else:
             # Use autocast for CUDA or CPU
             with torch.autocast(device_type = 'cuda' if USE_CUDA else 'cpu', dtype = torch.float16, enabled = USE_AMP):
-                loss = model(data, return_loss = True)
-                loss = loss / GRAD_ACCUM_EVERY
+                loss = model(data, return_loss = True, return_breakdown = True)
+                if isinstance(loss, tuple):
+                    total_loss, _ = loss
+                    loss = total_loss / GRAD_ACCUM_EVERY
+                    print(f"training loss: {total_loss.item():.3f}")
+                    epoch_train_loss += total_loss.item()
+                else:
+                    loss = loss / GRAD_ACCUM_EVERY
+                    print(f"training loss: {loss.item():.3f}")
+                    epoch_train_loss += loss.item()
             scaler.scale(loss).backward()
+        
+        num_batches += 1
 
-    print(f"training loss: {loss.item():.3f}")
-
+    # Calculate average training loss for this epoch
+    avg_train_loss = epoch_train_loss / num_batches
+    
     if USE_MPS:
         # For MPS, we don't use the scaler
         optim.step()
@@ -196,12 +268,49 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
     optim.zero_grad()
 
+    # Track validation loss
+    val_loss = None
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
             valid_data = next(val_loader)
-            loss = model(valid_data, return_loss = True)
-            print(f"validation loss: {loss.item():.3f}")
+            loss = model(valid_data, return_loss = True, return_breakdown = True)
+            if isinstance(loss, tuple):
+                total_loss, _ = loss
+                val_loss = total_loss.item()
+                print(f"validation loss: {val_loss:.3f}")
+            else:
+                val_loss = loss.item()
+                print(f"validation loss: {val_loss:.3f}")
+    
+    # Update metrics
+    metrics['epochs'].append(i + 1)
+    metrics['train_loss'].append(avg_train_loss)
+    if val_loss is not None:
+        metrics['val_loss'].append(val_loss)
+    else:
+        # If we didn't validate this epoch, use the last validation loss
+        if metrics['val_loss']:
+            metrics['val_loss'].append(metrics['val_loss'][-1])
+        else:
+            metrics['val_loss'].append(avg_train_loss)  # Fallback to training loss if no validation yet
+    
+    # Save metrics periodically
+    if (i + 1) % 100 == 0:
+        save_metrics(metrics)
+
+    # Save model checkpoint every SAVE_EVERY epochs
+    if (i + 1) % SAVE_EVERY == 0:
+        checkpoint_path = f"checkpoints/model_epoch_{i+1}.pt"
+        torch.save({
+            'epoch': i + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+            'loss': loss.item() if not isinstance(loss, tuple) else loss[0].item(),
+        }, checkpoint_path)
+        print(f"Model saved to {checkpoint_path}")
+        # Also save metrics with the checkpoint
+        save_metrics(metrics, f"metrics/metrics_epoch_{i+1}.json")
 
     if i % GENERATE_EVERY == 0:
         model.eval()
