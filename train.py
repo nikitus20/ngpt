@@ -31,7 +31,15 @@ USE_CUDA = torch.cuda.is_available()
 USE_AMP = USE_CUDA  # Enable AMP only if CUDA is available
 USE_PARAMETRIZE = True # whether to manually update weights after each optimizer step
 
-device = torch.device('cuda:0' if USE_CUDA else 'cpu')
+# Ensure we're using a single device
+if USE_CUDA:
+    if torch.cuda.device_count() > 1:
+        print(f"Multiple GPUs detected ({torch.cuda.device_count()}). Using first GPU.")
+    device = torch.device('cuda:0')
+else:
+    device = torch.device('cpu')
+
+print(f"Using device: {device}")
 
 assert not (USE_AMP and not torch.cuda.is_available())
 
@@ -98,13 +106,16 @@ def base_decoding(
 
 model = nGPT(
     num_tokens = 256,
-    dim = 256,
-    depth = 4,
+    dim = 512,
+    depth = 8,
     tied_embedding = True,
     add_value_residual = True,
     attn_norm_qk = False,
     manual_norm_weights = not USE_PARAMETRIZE
-).to(device)
+)
+
+# Move model to device after initialization
+model = model.to(device)
 
 scaler = GradScaler(enabled = USE_AMP)
 

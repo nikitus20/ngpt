@@ -540,6 +540,8 @@ class nGPT(Module):
         mask = None,
         return_loss = False
     ):
+        # Ensure input is on the correct device
+        device = ids.device
         token_embed, rotary_embed = self.token_embed.weight, self.rotary_embed
 
         if return_loss:
@@ -548,26 +550,23 @@ class nGPT(Module):
 
         tokens = token_embed[ids]
 
-        first_values = None
+        # Process through transformer layers
+        for attn_with_residual, ff_with_residual in self.layers:
+            tokens = attn_with_residual(tokens, mask = mask, rotary_embed = rotary_embed)
+            tokens = ff_with_residual(tokens)
 
-        for attn, ff in self.layers:
-            tokens, values = attn(tokens, mask = mask, rotary_embed = rotary_embed, return_values = True, value_residual = first_values if self.add_value_residual else None)
-
-            first_values = default(first_values, values)
-
-            tokens = ff(tokens)
-
-        if exists(self.to_logits):
+        # Get logits
+        if self.to_logits is not None:
             logits = self.to_logits(tokens)
         else:
-            # tied embeddings
-            logits = einsum(tokens, token_embed, 'b n d, c d -> b n c')
+            logits = einsum('b n d, d c -> b n c', tokens, self.token_embed.weight)
 
         logits = logits * self.logit_scale()
 
         if not return_loss:
             return logits
 
+        # Calculate loss
         loss = F.cross_entropy(
             rearrange(logits, 'b n c -> b c n'),
             labels,
