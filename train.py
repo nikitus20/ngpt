@@ -26,10 +26,12 @@ GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 512
 
-USE_AMP = True
+# Automatically detect CUDA and enable AMP
+USE_CUDA = torch.cuda.is_available()
+USE_AMP = USE_CUDA  # Enable AMP only if CUDA is available
 USE_PARAMETRIZE = True # whether to manually update weights after each optimizer step
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if USE_CUDA else 'cpu')
 
 assert not (USE_AMP and not torch.cuda.is_available())
 
@@ -96,8 +98,8 @@ def base_decoding(
 
 model = nGPT(
     num_tokens = 256,
-    dim = 512,
-    depth = 8,
+    dim = 256,
+    depth = 4,
     tied_embedding = True,
     add_value_residual = True,
     attn_norm_qk = False,

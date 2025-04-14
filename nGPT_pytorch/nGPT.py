@@ -85,6 +85,9 @@ class Scale(Module):
             self.dim == other.dim
         )
 
+    def __hash__(self):
+        return hash(self.dim)
+
     def forward(self):
         return self.scale * self.forward_scale
 
@@ -171,6 +174,9 @@ class NormLinear(Module):
             self.dim_out == x.dim_out
         )
 
+    def __hash__(self):
+        return hash((self.dim, self.dim_out))
+
     @torch.no_grad()
     def norm_weights_(self):
         if self.parametrize:
@@ -214,7 +220,6 @@ class Attention(Module):
         super().__init__()
         self.dim = dim
         self.dim_head = dim_head
-
         self.heads = heads
         self.causal = causal
 
@@ -247,6 +252,9 @@ class Attention(Module):
 
     def __eq__(x, y):
         return x.dim == y.dim and x.heads == y.heads and x.dim_head == y.dim_head
+
+    def __hash__(self):
+        return hash((self.dim, self.heads, self.dim_head))
 
     def forward(
         self,
@@ -346,6 +354,9 @@ class FeedForward(Module):
 
     def __eq__(x, y):
         return x.dim == y.dim and x.expand_factor == y.expand_factor
+
+    def __hash__(self):
+        return hash((self.dim, self.expand_factor))
 
     def forward(self, x):
         hidden, gate = self.to_hidden(x), self.to_gate(x)
@@ -497,13 +508,15 @@ class nGPT(Module):
     def __eq__(self, other):
         return (
             isinstance(other, nGPT) and
-            self.num_tokens == other.num_tokens and 
+            self.num_tokens == other.num_tokens and
             self.dim == other.dim and
-            self.dim_head == other.dim_head and
             self.depth == other.depth and
             self.heads == other.heads and
-            self.ff_expand_factor == other.ff_expand_factor
+            self.dim_head == other.dim_head
         )
+
+    def __hash__(self):
+        return hash((self.num_tokens, self.dim, self.depth, self.heads, self.dim_head))
 
     @torch.no_grad()
     def norm_weights_(self):
