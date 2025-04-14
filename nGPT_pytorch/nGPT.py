@@ -139,6 +139,80 @@ class Residual(Module):
 
         return out
 
+# adaptive normalization residual based on token-update alignment
+class NormResidual(Module):
+    def __init__(
+        self,
+        fn: Module,
+        dim: int,
+        init: float,
+        scale: float | None = None,
+        groups = 1,
+        norm_eps = 0.,
+        min_norm = 1.0,
+        scale_factor = 1.0
+    ):
+        super().__init__()
+        self.fn = fn
+        self.branch_scale = Scale(dim, init, default(scale, dim ** -0.5))
+        self.l2norm = L2Norm(dim = -1, norm_eps = norm_eps, groups = groups)
+        self.min_norm = min_norm
+        self.scale_factor = scale_factor
+        
+    def to(self, device):
+        super().to(device)
+        self.fn = self.fn.to(device)
+        self.branch_scale = self.branch_scale.to(device)
+        return self
+        
+    def forward(self, x, r=None, **kwargs):
+        device = x.device
+        residual = x
+        
+        # Initialize normalizer if not provided
+        if r is None:
+            r = torch.ones(x.size(0), x.size(1), 1, device=device) * self.min_norm
+            
+        # Apply function (attention/FF)
+        out = self.fn(x, **kwargs)
+        
+        # Handle tuple outputs
+        tuple_output = isinstance(out, tuple)
+        if tuple_output:
+            out, *rest = out
+            
+        # Normalize the output
+        normalized_out = self.l2norm(out)
+        
+        # Calculate alignment (cosine similarity) between input and output
+        # For each token: how aligned are the original and transformed vectors?
+        # We use normalized vectors to get proper cosine similarity
+        normalized_x = self.l2norm(residual)
+        alignment = torch.sum(normalized_x * normalized_out, dim=-1, keepdim=True)
+        
+        # Update normalizer based on alignment
+        # Higher alignment means higher r value (more conservative updates)
+        # Scale_factor controls how quickly r grows
+        r = r + alignment * self.scale_factor
+        
+        # Apply the branch scale (learned parameter)
+        branch_scale = self.branch_scale().to(device)
+        
+        # Apply update with normalization
+        # Instead of standard lerp, we divide the contribution of the update by r
+        mixed = residual + (normalized_out - residual) * branch_scale / r
+        
+        # Final normalization
+        out = self.l2norm(mixed)
+        
+        # Reconstruct tuple if needed
+        if tuple_output:
+            out = (out, *rest, r)  # Pass normalizer to next layer
+        else:
+            out = (out, r)  # Pass normalizer to next layer
+            
+        return out
+
 # for use with parametrize
 
 class L2Norm(Module):
@@ -442,27 +516,35 @@ class nGPT(Module):
             enable_math = True,
             enable_mem_efficient = True
         ),
-        norm_eps = 0. # greater than 0 allows the norm to be around (1. - norm_eps) to (1. + norm_eps)
+        norm_eps = 0., # greater than 0 allows the norm to be around (1. - norm_eps) to (1. + norm_eps)
+        use_norm_residual = False, # whether to use the NormResidual connection instead of standard Residual
+        norm_residual_min_norm = 1.0, # minimum value for the normalizer in NormResidual
+        norm_residual_scale_factor = 1.0 # how quickly the normalizer grows in NormResidual
     ):
         super().__init__()
-        NormLinear_ = partial(NormLinear, parametrize = not manual_norm_weights, norm_eps = norm_eps, groups = num_hyperspheres)
         self.l2norm = partial(l2norm, norm_eps = norm_eps, groups = num_hyperspheres)
 
         self.num_tokens = num_tokens
         self.dim = dim
-        self.heads = heads
-        self.dim_head = dim_head
         self.depth = depth
-        self.ff_expand_factor = ff_expand_factor
-
+        self.dim_head = dim_head
+        self.heads = heads
         self.causal = causal
+        self.tied_embedding = tied_embedding
         alpha_init = default(alpha_init, 1. / depth)
 
-        self.add_value_residual = add_value_residual # https://arxiv.org/abs/2410.17897v1
+        NormLinear_ = partial(NormLinear, parametrize = not manual_norm_weights, norm_eps = norm_eps, groups = num_hyperspheres)
 
         # Initialize token embedding and rotary embedding
         self.token_embed = NormLinear_(dim, num_tokens)
         self.rotary_embed = RotaryEmbedding(dim_head)
+
+        self.add_value_residual = add_value_residual # https://arxiv.org/abs/2410.17897v1
+
+        # Store residual connection type and parameters
+        self.use_norm_residual = use_norm_residual
+        self.norm_residual_min_norm = norm_residual_min_norm
+        self.norm_residual_scale_factor = norm_residual_scale_factor
 
         self.layers = ModuleList([])
 
@@ -520,19 +602,43 @@ class nGPT(Module):
                 num_hyperspheres = num_hyperspheres
             )
 
-            attn_with_residual = Residual(
-                attn,
-                dim,
-                default(alpha_attn_init_, alpha_init),
-                default(alpha_attn_scale_, dim ** -0.5)
-            )
+            # Choose which residual connection to use based on the use_norm_residual flag
+            if use_norm_residual:
+                attn_with_residual = NormResidual(
+                    attn,
+                    dim,
+                    default(alpha_attn_init_, alpha_init),
+                    default(alpha_attn_scale_, dim ** -0.5),
+                    norm_eps=norm_eps,
+                    groups=num_hyperspheres,
+                    min_norm=norm_residual_min_norm,
+                    scale_factor=norm_residual_scale_factor
+                )
 
-            ff_with_residual = Residual(
-                ff,
-                dim,
-                default(alpha_ff_init_, alpha_init),
-                default(alpha_ff_scale_, dim ** -0.5)
-            )
+                ff_with_residual = NormResidual(
+                    ff,
+                    dim,
+                    default(alpha_ff_init_, alpha_init),
+                    default(alpha_ff_scale_, dim ** -0.5),
+                    norm_eps=norm_eps,
+                    groups=num_hyperspheres,
+                    min_norm=norm_residual_min_norm,
+                    scale_factor=norm_residual_scale_factor
+                )
+            else:
+                attn_with_residual = Residual(
+                    attn,
+                    dim,
+                    default(alpha_attn_init_, alpha_init),
+                    default(alpha_attn_scale_, dim ** -0.5)
+                )
+
+                ff_with_residual = Residual(
+                    ff,
+                    dim,
+                    default(alpha_ff_init_, alpha_init),
+                    default(alpha_ff_scale_, dim ** -0.5)
+                )
 
             self.layers.append(ModuleList([attn_with_residual, ff_with_residual]))
 
@@ -587,11 +693,28 @@ class nGPT(Module):
             ids, labels = ids[:, :-1], ids[:, 1:]
 
         tokens = token_embed[ids]
+        
+        # Initialize normalizer r if using NormResidual
+        r = None
+        if self.use_norm_residual:
+            r = torch.ones(tokens.size(0), tokens.size(1), 1, device=device) * self.norm_residual_min_norm
+            # Initialize tensor to track normalizer values across layers
+            self.normalizer_values = torch.zeros(self.depth, device=device)
 
         # Process through transformer layers
-        for attn_with_residual, ff_with_residual in self.layers:
-            tokens = attn_with_residual(tokens, mask = mask, rotary_embed = rotary_embed)
-            tokens = ff_with_residual(tokens)
+        for i, (attn_with_residual, ff_with_residual) in enumerate(self.layers):
+            if self.use_norm_residual:
+                # For NormResidual, we need to pass and receive the normalizer r
+                tokens, r = attn_with_residual(tokens, r=r, mask=mask, rotary_embed=rotary_embed)
+                tokens, r = ff_with_residual(tokens, r=r)
+                
+                # Track average normalizer value for this layer
+                if return_loss:  # Only track during training
+                    self.normalizer_values[i] = r.mean().detach()
+            else:
+                # Standard path for regular Residual
+                tokens = attn_with_residual(tokens, mask=mask, rotary_embed=rotary_embed)
+                tokens = ff_with_residual(tokens)
 
         # Get logits
         if self.to_logits is not None:

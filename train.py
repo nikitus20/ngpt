@@ -49,6 +49,14 @@ else:
 
 print(f"Using device: {device}")
 
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Train the nGPT model')
+parser.add_argument('--checkpoint', type=str, help='Path to checkpoint file to resume training from')
+parser.add_argument('--use-norm-residual', action='store_true', help='Use the NormResidual connection architecture')
+parser.add_argument('--min-norm', type=float, default=1.0, help='Minimum value for the normalizer in NormResidual')
+parser.add_argument('--scale-factor', type=float, default=1.0, help='How quickly the normalizer grows in NormResidual')
+args = parser.parse_args()
+
 # helpers
 
 def exists(v):
@@ -117,8 +125,18 @@ model = nGPT(
     tied_embedding = True,
     add_value_residual = True,
     attn_norm_qk = False,
-    manual_norm_weights = not USE_PARAMETRIZE
+    manual_norm_weights = not USE_PARAMETRIZE,
+    use_norm_residual = args.use_norm_residual,
+    norm_residual_min_norm = args.min_norm,
+    norm_residual_scale_factor = args.scale_factor
 )
+
+# Print model architecture information
+residual_type = "NormResidual" if args.use_norm_residual else "Standard Residual"
+print(f"Using {residual_type} architecture")
+if args.use_norm_residual:
+    print(f"  - Minimum normalizer value: {args.min_norm}")
+    print(f"  - Normalizer scale factor: {args.scale_factor}")
 
 print(f"Moving model to device: {device}")
 model = model.to(device)
@@ -177,8 +195,13 @@ os.makedirs("metrics", exist_ok=True)
 metrics = {
     'train_loss': [],
     'val_loss': [],
-    'epochs': []
+    'epochs': [],
+    'normalizer_values': []
 }
+
+# Add normalizer tracking if using NormResidual
+if args.use_norm_residual:
+    metrics['normalizer_values'] = []
 
 # Function to save metrics
 def save_metrics(metrics, filename="metrics/training_metrics.json"):
@@ -198,11 +221,6 @@ def load_checkpoint(model, optimizer, checkpoint_path):
     else:
         print(f"Checkpoint {checkpoint_path} not found. Starting from scratch.")
         return 0
-
-# Check if a specific checkpoint should be loaded
-parser = argparse.ArgumentParser(description='Train the nGPT model')
-parser.add_argument('--checkpoint', type=str, help='Path to checkpoint file to resume training from')
-args = parser.parse_args()
 
 # training
 start_epoch = 0
@@ -294,6 +312,10 @@ for i in tqdm.tqdm(range(start_epoch, NUM_BATCHES), mininterval = 10.0, desc = "
             metrics['val_loss'].append(metrics['val_loss'][-1])
         else:
             metrics['val_loss'].append(avg_train_loss)  # Fallback to training loss if no validation yet
+            
+    # Record normalizer values if using NormResidual
+    if args.use_norm_residual and hasattr(model, 'normalizer_values'):
+        metrics['normalizer_values'].append(model.normalizer_values.cpu().tolist())
     
     # Save metrics periodically
     if (i + 1) % 100 == 0:
