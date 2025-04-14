@@ -88,6 +88,11 @@ class Scale(Module):
     def __hash__(self):
         return hash(self.dim)
 
+    def to(self, device):
+        super().to(device)
+        self.scale = nn.Parameter(self.scale.to(device))
+        return self
+
     def forward(self):
         return self.scale * self.forward_scale
 
@@ -108,7 +113,14 @@ class Residual(Module):
         self.branch_scale = Scale(dim, init, default(scale, dim ** -0.5))
         self.l2norm = L2Norm(dim = -1, norm_eps = norm_eps, groups = groups)
 
+    def to(self, device):
+        super().to(device)
+        self.fn = self.fn.to(device)
+        self.branch_scale = self.branch_scale.to(device)
+        return self
+
     def forward(self, x, **kwargs):
+        device = x.device
         residual = x
 
         out = self.fn(x, **kwargs)
@@ -119,7 +131,8 @@ class Residual(Module):
             out, *rest = out
 
         out = self.l2norm(out)
-        out = self.l2norm(residual.lerp(out, self.branch_scale()))
+        branch_scale = self.branch_scale().to(device)
+        out = self.l2norm(residual.lerp(out, branch_scale))
 
         if tuple_output:
             out = (out, *rest)
@@ -182,7 +195,6 @@ class NormLinear(Module):
         if self.parametrize:
             normed = self.weight
             original = self.linear.parametrizations.weight.original
-
             original.copy_(normed)
         else:
             self.weight.copy_(self.l2norm(self.weight))
@@ -191,7 +203,18 @@ class NormLinear(Module):
     def weight(self):
         return self.linear.weight
 
+    def to(self, device):
+        super().to(device)
+        self.linear = self.linear.to(device)
+        if hasattr(self.linear, 'parametrizations'):
+            for param in self.linear.parametrizations.values():
+                param.to(device)
+        return self
+
     def forward(self, x):
+        # Ensure input and weights are on the same device
+        if x.device != self.linear.weight.device:
+            self.to(x.device)
         return self.linear(x) * self.scale
 
 # attention
@@ -236,12 +259,10 @@ class Attention(Module):
         self.to_v = NormLinear_(dim, dim_inner)
 
         # flash attention related context manager
-
         sdpa_backends = [SDP_BACKEND_MAP[enable_str] for enable_str, enable in flash_kwargs.items() if enable]
         self.sdpa_context_manager = partial(torch.nn.attention.sdpa_kernel, sdpa_backends)
 
         # qk rmsnorm + scale
-
         self.norm_qk = norm_qk
         self.qk_scale = Scale(dim_inner, s_qk_init, default(s_qk_scale, dim ** -1))
 
@@ -256,6 +277,15 @@ class Attention(Module):
     def __hash__(self):
         return hash((self.dim, self.heads, self.dim_head))
 
+    def to(self, device):
+        super().to(device)
+        self.to_q = self.to_q.to(device)
+        self.to_k = self.to_k.to(device)
+        self.to_v = self.to_v.to(device)
+        self.qk_scale = self.qk_scale.to(device)
+        self.to_out = self.to_out.to(device)
+        return self
+
     def forward(
         self,
         x,
@@ -264,41 +294,35 @@ class Attention(Module):
         value_residual = None,
         return_values = False
     ):
+        device = x.device
         q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
 
         # split heads
-
         q, k, v = map(self.split_heads, (q, k, v))
 
         # maybe value residual, from resformer paper
-
         if exists(value_residual):
             v = 0.5 * (v + value_residual)
 
         # rotary positions
-
         if exists(rotary_embed):
             q = rotary_embed.rotate_queries_or_keys(q)
             k = rotary_embed.rotate_queries_or_keys(k)
 
         # maybe query key norm
-
         if self.norm_qk:
             q, k = map(self.l2norm, (q, k))
 
-        # scaling queries and keys - this would line up with the popular use of qk rmsnorm from google deepmind and now black forest labs - will use multihead rmsnorm
-
-        q = q * rearrange(self.qk_scale(), '(h d) -> h 1 d', h = self.heads)
+        # scaling queries and keys
+        qk_scale = self.qk_scale().to(device)
+        q = q * rearrange(qk_scale, '(h d) -> h 1 d', h = self.heads)
 
         # for non-autoregressive masking
-
         if exists(mask):
             row_all_masked_out = ~mask.any(dim = -1)
-
             mask = rearrange(mask, 'b j -> b 1 1 j')
 
         # scale is sqrt(dk)
-
         with self.sdpa_context_manager():
             out = F.scaled_dot_product_attention(
                 q, k, v,
@@ -358,11 +382,24 @@ class FeedForward(Module):
     def __hash__(self):
         return hash((self.dim, self.expand_factor))
 
+    def to(self, device):
+        super().to(device)
+        self.to_hidden = self.to_hidden.to(device)
+        self.to_gate = self.to_gate.to(device)
+        self.hidden_scale = self.hidden_scale.to(device)
+        self.gate_scale = self.gate_scale.to(device)
+        self.to_out = self.to_out.to(device)
+        return self
+
     def forward(self, x):
+        device = x.device
         hidden, gate = self.to_hidden(x), self.to_gate(x)
 
-        hidden = hidden * self.hidden_scale()
-        gate = gate * self.gate_scale() * (self.dim ** 0.5)
+        hidden_scale = self.hidden_scale().to(device)
+        gate_scale = self.gate_scale().to(device)
+
+        hidden = hidden * hidden_scale
+        gate = gate * gate_scale * torch.tensor(self.dim ** 0.5, device=device)
 
         hidden = F.silu(gate) * hidden
         return self.to_out(hidden)
@@ -423,8 +460,8 @@ class nGPT(Module):
 
         self.add_value_residual = add_value_residual # https://arxiv.org/abs/2410.17897v1
 
+        # Initialize token embedding and rotary embedding
         self.token_embed = NormLinear_(dim, num_tokens)
-
         self.rotary_embed = RotaryEmbedding(dim_head)
 
         self.layers = ModuleList([])
@@ -500,9 +537,7 @@ class nGPT(Module):
             self.layers.append(ModuleList([attn_with_residual, ff_with_residual]))
 
         self.to_logits = NormLinear_(dim, num_tokens) if not tied_embedding else None
-
         self.logit_scale = Scale(num_tokens, s_logit_init, default(s_logit_scale, dim ** -0.5))
-
         self.ignore_index = ce_ignore_index
 
     def __eq__(self, other):
@@ -540,16 +575,11 @@ class nGPT(Module):
         mask = None,
         return_loss = False
     ):
-        # Ensure input is on the correct device
         device = ids.device
-        
-        # Move all components to the same device as input
-        self.token_embed = self.token_embed.to(device)
-        if hasattr(self, 'rotary_embed'):
-            self.rotary_embed = self.rotary_embed.to(device)
-        
-        token_embed = self.token_embed.weight
+        token_embed = self.token_embed.weight.to(device)
         rotary_embed = getattr(self, 'rotary_embed', None)
+        if rotary_embed is not None:
+            rotary_embed = rotary_embed.to(device)
 
         if return_loss:
             assert self.causal
@@ -559,22 +589,17 @@ class nGPT(Module):
 
         # Process through transformer layers
         for attn_with_residual, ff_with_residual in self.layers:
-            # Ensure layer components are on the correct device
-            attn_with_residual = attn_with_residual.to(device)
-            ff_with_residual = ff_with_residual.to(device)
-            
             tokens = attn_with_residual(tokens, mask = mask, rotary_embed = rotary_embed)
             tokens = ff_with_residual(tokens)
 
         # Get logits
         if self.to_logits is not None:
-            self.to_logits = self.to_logits.to(device)
             logits = self.to_logits(tokens)
         else:
-            logits = einsum('b n d, d c -> b n c', tokens, self.token_embed.weight)
+            logits = tokens @ token_embed.t()
 
-        self.logit_scale = self.logit_scale.to(device)
-        logits = logits * self.logit_scale()
+        logit_scale = self.logit_scale().to(device)
+        logits = logits * logit_scale
 
         if not return_loss:
             return logits
@@ -587,3 +612,12 @@ class nGPT(Module):
         )
 
         return loss
+
+    def to(self, device):
+        # Override to method to ensure proper device placement
+        super().to(device)
+        # Ensure all submodules are on the correct device
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, Scale, NormLinear)):
+                module.to(device)
+        return self

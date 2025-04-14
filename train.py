@@ -26,22 +26,23 @@ GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 512
 
-# Automatically detect CUDA and enable AMP
+# Automatically detect available devices and enable AMP
 USE_CUDA = torch.cuda.is_available()
-USE_AMP = USE_CUDA  # Enable AMP only if CUDA is available
-USE_PARAMETRIZE = True # whether to manually update weights after each optimizer step
+USE_MPS = torch.backends.mps.is_available() and not USE_CUDA  # Only use MPS if CUDA is not available
+USE_AMP = USE_CUDA or USE_MPS  # Enable AMP for both CUDA and MPS
+USE_PARAMETRIZE = True  # whether to manually update weights after each optimizer step
 
 # Ensure we're using a single device
 if USE_CUDA:
     if torch.cuda.device_count() > 1:
         print(f"Multiple GPUs detected ({torch.cuda.device_count()}). Using first GPU.")
     device = torch.device('cuda:0')
+elif USE_MPS:
+    device = torch.device('mps')
 else:
     device = torch.device('cpu')
 
 print(f"Using device: {device}")
-
-assert not (USE_AMP and not torch.cuda.is_available())
 
 # helpers
 
@@ -114,22 +115,30 @@ model = nGPT(
     manual_norm_weights = not USE_PARAMETRIZE
 )
 
-# Move model to device after initialization
+print(f"Moving model to device: {device}")
 model = model.to(device)
 
-scaler = GradScaler(enabled = USE_AMP)
+# For MPS, ensure model is properly initialized
+if str(device) == 'mps':
+    # Force a forward pass to ensure all components are properly initialized
+    model.train()
+    dummy_input = torch.zeros(1, SEQ_LEN, dtype=torch.long, device=device)
+    with torch.no_grad():
+        _ = model(dummy_input)
+
+# Disable gradient scaler for MPS as it's not supported
+scaler = GradScaler(enabled = USE_AMP and not USE_MPS)
 
 # prepare enwik8 data
-
 with gzip.open("./data/enwik8.gz") as file:
     data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
     np_train, np_valid = np.split(data, [int(90e6)])
     data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, device):
         super().__init__()
-        self.data = data
+        self.data = torch.tensor(data, device=device)
         self.seq_len = seq_len
 
     def __len__(self):
@@ -138,42 +147,52 @@ class TextSamplerDataset(Dataset):
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.to(device)
+        return full_seq
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+train_dataset = TextSamplerDataset(data_train, SEQ_LEN, device)
+val_dataset = TextSamplerDataset(data_val, SEQ_LEN, device)
 train_loader = DataLoader(train_dataset, batch_size = BATCH_SIZE)
 val_loader = DataLoader(val_dataset, batch_size = BATCH_SIZE)
 
 # optimizer
-
 optim = Adam(model.parameters(), lr = LEARNING_RATE)
 
 train_loader = cycle(train_loader)
 val_loader = cycle(val_loader)
 
 # if not using parametrize, register normalizing on optimizer step
-
 if not USE_PARAMETRIZE:
     model.register_step_post_hook(optim)
 
 # training
-
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     model.train()
 
     for _ in range(GRAD_ACCUM_EVERY):
         data = next(train_loader)
 
-        with torch.autocast(device_type = 'cuda',  dtype = torch.float16, enabled = USE_AMP):
+        # For MPS, we need to handle training differently
+        if USE_MPS:
+            # MPS doesn't support autocast, so we'll just run without it
             loss = model(data, return_loss = True)
-
-        scaler.scale(loss / GRAD_ACCUM_EVERY).backward()
+            loss = loss / GRAD_ACCUM_EVERY
+            loss.backward()
+        else:
+            # Use autocast for CUDA or CPU
+            with torch.autocast(device_type = 'cuda' if USE_CUDA else 'cpu', dtype = torch.float16, enabled = USE_AMP):
+                loss = model(data, return_loss = True)
+                loss = loss / GRAD_ACCUM_EVERY
+            scaler.scale(loss).backward()
 
     print(f"training loss: {loss.item():.3f}")
 
-    scaler.step(optim)
-    scaler.update()
+    if USE_MPS:
+        # For MPS, we don't use the scaler
+        optim.step()
+    else:
+        # For CUDA or CPU, use the scaler
+        scaler.step(optim)
+        scaler.update()
 
     optim.zero_grad()
 
@@ -181,22 +200,16 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         model.eval()
         with torch.no_grad():
             valid_data = next(val_loader)
-
             loss = model(valid_data, return_loss = True)
             print(f"validation loss: {loss.item():.3f}")
 
     if i % GENERATE_EVERY == 0:
         model.eval()
-
         inp = random.choice(val_dataset)[:PRIME_LENGTH]
-
         prime = decode_tokens(inp)
         print(f"{prime} \n\n {'*' * 100}")
 
         prompt = inp[None, ...]
-
         sampled = base_decoding(model, prompt, GENERATE_LENGTH)
-
         base_decode_output = decode_tokens(sampled[0])
-
         print(f"\n\n{base_decode_output}\n")
