@@ -542,7 +542,14 @@ class nGPT(Module):
     ):
         # Ensure input is on the correct device
         device = ids.device
-        token_embed, rotary_embed = self.token_embed.weight, self.rotary_embed
+        
+        # Move all components to the same device as input
+        self.token_embed = self.token_embed.to(device)
+        if hasattr(self, 'rotary_embed'):
+            self.rotary_embed = self.rotary_embed.to(device)
+        
+        token_embed = self.token_embed.weight
+        rotary_embed = getattr(self, 'rotary_embed', None)
 
         if return_loss:
             assert self.causal
@@ -552,15 +559,21 @@ class nGPT(Module):
 
         # Process through transformer layers
         for attn_with_residual, ff_with_residual in self.layers:
+            # Ensure layer components are on the correct device
+            attn_with_residual = attn_with_residual.to(device)
+            ff_with_residual = ff_with_residual.to(device)
+            
             tokens = attn_with_residual(tokens, mask = mask, rotary_embed = rotary_embed)
             tokens = ff_with_residual(tokens)
 
         # Get logits
         if self.to_logits is not None:
+            self.to_logits = self.to_logits.to(device)
             logits = self.to_logits(tokens)
         else:
             logits = einsum('b n d, d c -> b n c', tokens, self.token_embed.weight)
 
+        self.logit_scale = self.logit_scale.to(device)
         logits = logits * self.logit_scale()
 
         if not return_loss:
